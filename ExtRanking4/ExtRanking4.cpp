@@ -8,15 +8,39 @@
 #include <random>
 #include <ctime>
 
-//TODO use single file for the data sorted by second value during join
 //TODO join_and_delete can write data more rare
 //TODO share list of temp files during sort
 //TODO "eat" down steps, which led to no nodes removal. But doesn't help dues to allocator speed issues:(
+//TODO sort can write into original file.
 
 typedef unsigned int UINT;
 
-static const UINT buffer_size = 448 * 320; //84 is min
-static UINT* global_buffer = new UINT[buffer_size];
+static const UINT buffer_size = 768 * 640; //84 is min
+static UINT* global_buffer = new UINT[buffer_size / sizeof(UINT)];
+
+namespace temp {
+	static FILE* shared_temp_file1 = NULL;
+	static const char* shared_temp_file_name1 = "temp1";
+
+	static FILE* shared_temp_file2 = NULL;
+	static const char* shared_temp_file_name2 = "temp2";
+
+	void create_shared_temp_file() {
+		errno_t err = 0;
+
+		err = fopen_s(&shared_temp_file1, shared_temp_file_name1, "w+b");
+		if (err != 0) {
+			printf_s("Couldn't create shared temp file 1\n");
+			return;
+		}
+
+		err = fopen_s(&shared_temp_file2, shared_temp_file_name2, "w+b");
+		if (err != 0) {
+			printf_s("Couldn't create shared temp file 2\n");
+			return;
+		}
+	}
+}
 
 namespace util {
 
@@ -78,16 +102,8 @@ namespace comp {
 }
 
 namespace sort {
-	int create_temp_files(const char* input_filename, int element_count, size_t element_size, int(*compare)(const void*, const void*)) {
-		// Opening input file
-		FILE *input = NULL;
+	int create_temp_files(FILE *input, int element_count, size_t element_size, int(*compare)(const void*, const void*)) {
 		errno_t err = 0;
-		err = fopen_s(&input, input_filename, "rb");
-		if (err != 0) {
-			printf("Error opening input file\n");
-			return 0;
-		}
-
 		// Reading array size
 		UINT count;
 		fread(&count, sizeof(UINT), 1, input);
@@ -120,12 +136,27 @@ namespace sort {
 			fclose(temp);
 		}
 
+		return count;
+	}
+
+	int create_temp_files(const char* input_filename, int element_count, size_t element_size, int(*compare)(const void*, const void*)) {
+		// Opening input file
+		FILE *input = NULL;
+		errno_t err = 0;
+		err = fopen_s(&input, input_filename, "rb");
+		if (err != 0) {
+			printf("Error opening input file\n");
+			return 0;
+		}
+
+		int count = create_temp_files(input, element_count, element_size, compare);
+
 		fclose(input);
 
 		return count;
 	}
 
-	void merge_two_temp_files(const char* suffix, const int deep1, const int deep2, const int id1, const int id2, int element_count, size_t element_size, int(*compare)(const void*, const void*), bool write_size) {
+	void merge_two_temp_files(const int deep1, const int deep2, const int id1, const int id2, int element_count, size_t element_size, int(*compare)(const void*, const void*), bool write_size) {
 		const int files_count = 2;
 		const int buffer_lenght = buffer_size / element_size * element_count;
 		const int block_size = buffer_size / (files_count + 1);
@@ -231,7 +262,7 @@ namespace sort {
 		delete[] files;
 	}
 
-	void merge_all_temp_files(const char* input_filename, const char* output_filename, const int count, int element_count, size_t element_size, int(*compare)(const void*, const void*), bool write_size) {
+	void merge_all_temp_files(const char* output_filename, const int count, int element_count, size_t element_size, int(*compare)(const void*, const void*), bool write_size) {
 		const int buffer_lenght = buffer_size / element_size * element_count;
 		const int files_count = element_count * count / buffer_lenght + (((element_count * count) % buffer_lenght) ? 1 : 0);
 
@@ -249,7 +280,7 @@ namespace sort {
 		while (processed != files_count - 1) {
 			for (int i = 0; i < files_count; i += step) {
 				if (i + bias < files_count) {
-					merge_two_temp_files(input_filename, file_deeps[i], file_deeps[i + bias], file_indeces[i], file_indeces[i + bias], element_count, element_size, compare, write_size || (processed + 1 != files_count - 1));
+					merge_two_temp_files(file_deeps[i], file_deeps[i + bias], file_indeces[i], file_indeces[i + bias], element_count, element_size, compare, write_size || (processed + 1 != files_count - 1));
 					file_deeps[i] = deep + 1;
 					++processed;
 				}
@@ -272,9 +303,14 @@ namespace sort {
 		}
 	}
 
+	void ext_sort(FILE *input, const char* output_filename, int element_count, size_t element_size, int(*compare)(const void*, const void*), bool write_size) {
+		int count = create_temp_files(input, element_count, element_size, compare);
+		merge_all_temp_files(output_filename, count, element_count, element_size, compare, write_size);
+	}
+
 	void ext_sort(const char* input_filename, const char* output_filename, int element_count, size_t element_size, int(*compare)(const void*, const void*), bool write_size) {
 		int count = create_temp_files(input_filename, element_count, element_size, compare);
-		merge_all_temp_files(input_filename, output_filename, count, element_count, element_size, compare, write_size);
+		merge_all_temp_files(output_filename, count, element_count, element_size, compare, write_size);
 	}
 }
 
@@ -443,6 +479,32 @@ namespace prepare {
 
 namespace ranking {
 
+	void mark_elements_to_delete(FILE *input, FILE *output) {
+		int count;
+		fread(&count, sizeof(int), 1, input);
+		fwrite(&count, sizeof(UINT), 1, output);
+
+		const int base_buffer_lenght = buffer_size / 7 / sizeof(UINT);
+
+		UINT* input_buffer = global_buffer;
+		UINT* output_buffer = global_buffer + base_buffer_lenght * 3;
+
+		for (int i = 0; i < count; i += base_buffer_lenght) {
+			const UINT process_count = std::min(base_buffer_lenght, count - i);
+
+			fread(input_buffer, sizeof(UINT), process_count * 3, input);
+
+			for (int j = 0; j < process_count; ++j) {
+				output_buffer[j * 4] = input_buffer[j * 3];
+				output_buffer[j * 4 + 1] = input_buffer[j * 3 + 1];
+				output_buffer[j * 4 + 2] = input_buffer[j * 3 + 2];
+				output_buffer[j * 4 + 3] = std::rand() % 2;
+			}
+
+			fwrite(output_buffer, sizeof(UINT), process_count * 4, output);
+		}
+	}
+
 	void mark_elements_to_delete(const char* input_filename, const char* output_filename) {
 		errno_t err = 0;
 
@@ -460,58 +522,13 @@ namespace ranking {
 			return;
 		}
 
-		int count;
-		fread(&count, sizeof(int), 1, elements_input);
-		fwrite(&count, sizeof(UINT), 1, output);
-
-		const int base_buffer_lenght = buffer_size / 7 / sizeof(UINT);
-
-		UINT* input_buffer = global_buffer;
-		UINT* output_buffer = global_buffer + base_buffer_lenght * 3;
-
-		for (int i = 0; i < count; i += base_buffer_lenght) {
-			const UINT process_count = std::min(base_buffer_lenght, count - i);
-
-			fread(input_buffer, sizeof(UINT), process_count * 3, elements_input);
-
-			for (int j = 0; j < process_count; ++j) {
-				output_buffer[j * 4] = input_buffer[j * 3];
-				output_buffer[j * 4 + 1] = input_buffer[j * 3 + 1];
-				output_buffer[j * 4 + 2] = input_buffer[j * 3 + 2];
-				output_buffer[j * 4 + 3] = std::rand() % 2;
-			}
-
-			fwrite(output_buffer, sizeof(UINT), process_count * 4, output);
-		}
+		mark_elements_to_delete(elements_input, output);
 
 		fclose(elements_input);
 		fclose(output);
 	}
 
-	UINT join_and_delete(const char* input1_filename, const char* input2_filename, const char* output_filename) {
-		errno_t err = 0;
-
-		FILE *input1 = NULL;
-		err = fopen_s(&input1, input1_filename, "rb");
-		if (err != 0) {
-			printf("Error opening input1 file\n");
-			return -1;
-		}
-
-		FILE *input2 = NULL;
-		err = fopen_s(&input2, input2_filename, "rb");
-		if (err != 0) {
-			printf("Error opening input2 file\n");
-			return -1;
-		}
-
-		FILE *output = NULL;
-		err = fopen_s(&output, output_filename, "wb");
-		if (err != 0) {
-			printf("Error opening join file\n");
-			return -1;
-		}
-
+	UINT join_and_delete(FILE *input1, FILE *input2, FILE *output) {
 		int count1;
 		fread(&count1, sizeof(int), 1, input1);
 
@@ -572,6 +589,35 @@ namespace ranking {
 		rewind(output);
 		fwrite(&total_count_left, sizeof(UINT), 1, output);
 
+		return total_count_left;
+	}
+
+	UINT join_and_delete(const char* input1_filename, const char* input2_filename, const char* output_filename) {
+		errno_t err = 0;
+
+		FILE *input1 = NULL;
+		err = fopen_s(&input1, input1_filename, "rb");
+		if (err != 0) {
+			printf("Error opening input1 file\n");
+			return -1;
+		}
+
+		FILE *input2 = NULL;
+		err = fopen_s(&input2, input2_filename, "rb");
+		if (err != 0) {
+			printf("Error opening input2 file\n");
+			return -1;
+		}
+
+		FILE *output = NULL;
+		err = fopen_s(&output, output_filename, "wb");
+		if (err != 0) {
+			printf("Error opening join file\n");
+			return -1;
+		}
+
+		UINT total_count_left = join_and_delete(input1, input2, output);
+
 		fclose(input1);
 		fclose(input2);
 		fclose(output);
@@ -586,20 +632,41 @@ namespace ranking {
 		const std::string not_sorted_output_filename = util::create_filename(self_joined_file_name.c_str(), "_nso");
 
 		UINT count_after_deletion = count;
-		mark_elements_to_delete(sorted_input_filename, marked_file_name.c_str());
+		
+		{
+			// mark items in sorted input for deletion
+			FILE *sorted_input_file = NULL;
+			fopen_s(&sorted_input_file, sorted_input_filename, "rb");
+			rewind(temp::shared_temp_file1);
+			mark_elements_to_delete(sorted_input_file, temp::shared_temp_file1);
+			fclose(sorted_input_file);
 
-		std::cout << "Marked to delete (previously sorted):\n";
-		//test::display_result(marked_file_name.c_str(), 4, 0);
+			std::cout << "Marked to delete (previously sorted):\n";
+			//test::display_result(marked_file_name.c_str(), 4, 0);
+		}
 
-		sort::ext_sort(marked_file_name.c_str(), marked_file_name_2.c_str(), 4, 4 * sizeof(UINT), comp::compare2, true);
+		{
+			rewind(temp::shared_temp_file1);
+			sort::ext_sort(temp::shared_temp_file1, marked_file_name_2.c_str(), 4, 4 * sizeof(UINT), comp::compare2, true);
 
-		//test::display_result(marked_file_name.c_str(), 4, 0);
-		//test::display_result(marked_file_name_2.c_str(), 4, 0);
+			//test::display_result(marked_file_name.c_str(), 4, 0);
+			//test::display_result(marked_file_name_2.c_str(), 4, 0);
+		}
 
-		count_after_deletion = join_and_delete(marked_file_name.c_str(), marked_file_name_2.c_str(), not_sorted_output_filename.c_str());
-		//test::display_result(not_sorted_output_filename.c_str(), 3, 0);
+		{
+			FILE *marked_file_2 = NULL;
+			fopen_s(&marked_file_2, marked_file_name_2.c_str(), "rb");
+			rewind(temp::shared_temp_file1);
+			rewind(temp::shared_temp_file2);
+			count_after_deletion = join_and_delete(temp::shared_temp_file1, marked_file_2, temp::shared_temp_file2);
+			//test::display_result(not_sorted_output_filename.c_str(), 3, 0);
+			fclose(marked_file_2);
 
-		sort::ext_sort(not_sorted_output_filename.c_str(), sorted_output_filename, 3, 3 * sizeof(UINT), comp::compare1, true);
+			rewind(temp::shared_temp_file2);
+			sort::ext_sort(temp::shared_temp_file2, sorted_output_filename, 3, 3 * sizeof(UINT), comp::compare1, true);
+		}
+
+
 		return count_after_deletion;
 	}
 
@@ -877,13 +944,14 @@ int main()
 	remove("temp1.bin");
 	remove("temp2.bin");
 	remove("join.bin");
-	test::create_test_input();
+	test::create_test_input(2500000, 0);
 	std::cout << "Input:\n";
 	//test::display_result("input.bin", 2, 0);
 
 	const auto startTime = std::clock();
 
 	// Prepare stage
+	temp::create_shared_temp_file();
 	UINT sublist_size = prepare::add_weights_and_sort("input.bin", "down_input_0");
 
 	std::cout << "Sorted, ranked, weighted\n";
@@ -934,7 +1002,7 @@ int main()
 	UINT count = ranking::do_answer("sorted_stripped", "output.bin");
 	const auto endTime = std::clock();
 
-	test::display_result("output.bin", 1, count);
+	//test::display_result("output.bin", 1, count);
 
 	// Calculating execution time
 	double time = double(endTime - startTime) / CLOCKS_PER_SEC;
